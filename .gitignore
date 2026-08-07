@@ -1,0 +1,18 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local archives and generated packages
+*.zip
+*.crx
+*.pem
+
+# Local logs and temporary files
+*.log
+tmp/
+temp/
+

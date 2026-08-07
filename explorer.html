@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Library Manager</title>
+    <link rel="stylesheet" href="explorer.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">L</div>
+          <div>
+            <strong>Library Manager</strong>
+            <span>Local index</span>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="Library views">
+          <button class="nav-item active" data-filter="all">
+            <span class="nav-icon">▦</span><span>All files</span><span class="nav-count" id="all-count">0</span>
+          </button>
+          <button class="nav-item" data-filter="images">
+            <span class="nav-icon">▧</span><span>Images</span><span class="nav-count" id="image-count">0</span>
+          </button>
+          <button class="nav-item" data-filter="documents">
+            <span class="nav-icon">▤</span><span>Documents</span><span class="nav-count" id="document-count">0</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-heading">
+          <span>Folder navigation</span>
+        </div>
+        <div class="folder-tree" id="folder-tree"></div>
+
+        <div class="sidebar-footer">
+          <div class="cache-meta">
+            <span id="cache-dot" class="cache-dot"></span>
+            <span id="cache-summary">No local index yet</span>
+          </div>
+          <button class="text-button" id="clear-cache-button">Clear local cache</button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="connection-copy">
+            <div class="connection-row">
+              <span class="status-pill disconnected" id="status-pill"><span></span>Not connected</span>
+              <span class="status-detail" id="status-detail">Open the ChatGPT Library to begin.</span>
+            </div>
+          </div>
+          <div class="top-actions">
+            <button class="button ghost" id="settings-button">Settings</button>
+            <button class="button ghost" id="view-mode-button">Undock</button>
+            <button class="button secondary" id="open-library-button">Open ChatGPT Library</button>
+            <button class="button ghost" id="reindex-button" hidden>Reindex current folder</button>
+            <button class="button primary" id="scan-button" disabled>
+              <span class="scan-icon">↻</span><span>Index current folder</span>
+            </button>
+          </div>
+        </header>
+
+        <section class="content">
+          <div class="title-row">
+            <div>
+              <div class="breadcrumbs" id="breadcrumbs"><span>Library</span></div>
+              <h1 id="folder-title">Library</h1>
+            </div>
+            <label class="search-box">
+              <span aria-hidden="true">⌕</span>
+              <input id="search-input" type="search" placeholder="Search all cached files and folders" autocomplete="off">
+              <kbd>Ctrl K</kbd>
+            </label>
+          </div>
+
+          <div class="actionbar">
+            <div class="selection-copy" id="selection-copy">0 items selected</div>
+            <div class="actionbar-buttons">
+              <button class="button ghost" id="focus-library-button" disabled>Show in ChatGPT</button>
+              <button class="button danger" id="review-delete-button" disabled>Review delete</button>
+            </div>
+          </div>
+
+          <div class="index-error" id="index-error" hidden>
+            <div>
+              <strong>Failed to index <span id="index-error-folder">this folder</span>.</strong>
+              <span id="index-error-message">ChatGPT did not finish loading its files.</span>
+              <small>Retry clears only this folder’s local index, reloads the Library, returns to the same folder, and rebuilds it.</small>
+            </div>
+            <div class="index-error-actions">
+              <button class="button ghost" id="dismiss-index-error">Dismiss</button>
+              <button class="button danger" id="retry-index-button">Clear and retry</button>
+            </div>
+          </div>
+
+          <div class="live-scan" id="live-scan" hidden>
+            <div class="live-scan-copy">
+              <span class="live-pulse" aria-hidden="true"></span>
+              <strong><span id="live-count">0</span> rows captured</strong>
+              <span id="live-pass">Starting…</span>
+              <span id="live-batch"></span>
+            </div>
+            <div class="live-scan-meter" aria-hidden="true">
+              <span id="live-progress-bar"></span>
+            </div>
+            <span class="live-scroll" id="live-scroll">Finding the Library list…</span>
+          </div>
+
+          <div class="table-wrap">
+            <table class="file-table">
+              <thead>
+                <tr>
+                  <th class="check-column"><input id="select-all" type="checkbox" aria-label="Select all visible files"></th>
+                  <th><button class="sort-button" data-sort="name">Name <span class="sort-arrow" aria-hidden="true"></span></button></th>
+                  <th class="modified-column"><button class="sort-button active" data-sort="modified">Modified <span class="sort-arrow" aria-hidden="true">↓</span></button></th>
+                  <th class="size-column"><button class="sort-button" data-sort="size">Size <span class="sort-arrow" aria-hidden="true"></span></button></th>
+                  <th class="extension-column"><button class="sort-button" data-sort="extension">Extension <span class="sort-arrow" aria-hidden="true"></span></button></th>
+                  <th class="folder-column"><button class="sort-button" data-sort="folder">In Folder <span class="sort-arrow" aria-hidden="true"></span></button></th>
+                </tr>
+              </thead>
+              <tbody id="file-body"></tbody>
+            </table>
+            <div class="empty-state" id="empty-state">
+              <div class="empty-icon">⌁</div>
+              <h2>Your fast local view starts here</h2>
+              <p>Open ChatGPT Library, then index the current folder. The extension scrolls through the virtual list and caches every row it sees.</p>
+              <button class="button primary" id="empty-open-button">Open ChatGPT Library</button>
+            </div>
+          </div>
+
+          <div class="scan-footer">
+            <span id="scan-summary">Ready</span>
+            <span>Files stay in ChatGPT. Only index metadata and thumbnail URLs are cached locally.</span>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="preview-card" id="preview-card" hidden>
+      <div class="preview-stage" id="preview-stage"></div>
+      <div class="preview-copy">
+        <strong id="preview-name"></strong>
+        <span id="preview-meta"></span>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="delete-modal" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">Safety review</span>
+            <h2 id="delete-title">Delete selected files</h2>
+          </div>
+          <button class="icon-button" id="close-modal-button" aria-label="Close">×</button>
+        </div>
+        <div class="warning-box" id="delete-warning">
+          The first reviewed file calibrates ChatGPT’s current delete request through its native confirmation. Later reviewed files use that authenticated request directly and remain recoverable from Recently Deleted for 30 days.
+        </div>
+        <div class="delete-list" id="delete-list"></div>
+        <div class="delete-progress" id="delete-progress" hidden>
+          <div class="delete-progress-heading">
+            <strong id="delete-progress-title">Preparing deletion…</strong>
+            <span id="delete-progress-count">0 / 0</span>
+          </div>
+          <div class="delete-progress-track"><span id="delete-progress-bar"></span></div>
+          <div class="delete-progress-stats">
+            <span><strong id="delete-success-count">0</strong> deleted</span>
+            <span><strong id="delete-absent-count">0</strong> already absent</span>
+            <span><strong id="delete-failed-count">0</strong> failed</span>
+          </div>
+          <div class="delete-progress-time" id="delete-progress-time">Calculating request rate…</div>
+          <div class="delete-errors" id="delete-errors" hidden></div>
+        </div>
+        <div class="modal-footer">
+          <span id="delete-total"></span>
+          <div>
+            <button class="button secondary" id="cancel-delete-button">Cancel</button>
+            <button class="button danger" id="stop-delete-button" hidden>Stop</button>
+            <button class="button danger" id="confirm-delete-button" disabled>Delete selected</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="settings-modal" hidden>
+      <section class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow settings-eyebrow">Library Manager settings</span>
+            <h2 id="settings-title">Manager behavior</h2>
+          </div>
+          <button class="icon-button" id="close-settings-button" aria-label="Close settings">×</button>
+        </div>
+        <div class="settings-body">
+          <div class="setting-heading">
+            <div>
+              <strong>Random delay between scrolls</strong>
+              <span>Each slider position represents a five-second window.</span>
+            </div>
+            <output id="delay-range-output" for="delay-slider">8–12 seconds</output>
+          </div>
+          <input id="delay-slider" class="settings-slider" type="range" min="5" max="60" step="1" value="12">
+          <div class="slider-scale" aria-hidden="true"><span>1–5 sec</span><span>56–60 sec</span></div>
+          <div class="setting-group">
+            <div class="setting-heading">
+              <div>
+                <strong>Parallel delete requests</strong>
+                <span>Conservative concurrency is recommended. Failed requests are retried and logged without stopping the queue.</span>
+              </div>
+              <output id="delete-concurrency-output" for="delete-concurrency-slider">5 requests</output>
+            </div>
+            <input id="delete-concurrency-slider" class="settings-slider" type="range" min="1" max="30" step="1" value="5">
+            <div class="slider-scale" aria-hidden="true"><span>1 request</span><span>30 requests</span></div>
+          </div>
+          <div class="setting-group">
+            <div class="setting-heading">
+              <div>
+                <strong>Delete request calibration</strong>
+                <span>The same-session request template is stored only in this Chrome profile and is cleared automatically when authentication expires.</span>
+              </div>
+              <output id="delete-calibration-status">Not calibrated</output>
+            </div>
+            <div class="setting-action">
+              <button class="button secondary" id="clear-delete-calibration-button">Clear calibration</button>
+              <span>Clear this when ChatGPT changes its deletion request or you want to calibrate again.</span>
+            </div>
+          </div>
+          <div class="setting-group">
+            <div class="setting-heading">
+              <div>
+                <strong>Known-item passes count</strong>
+                <span>How deeply an update verifies cached rows before stopping.</span>
+              </div>
+              <output id="passes-output" for="passes-slider">2 passes</output>
+            </div>
+            <input id="passes-slider" class="settings-slider" type="range" min="2" max="100" step="1" value="2">
+            <div class="slider-scale" aria-hidden="true"><span>2 passes</span><span>100 passes</span></div>
+          </div>
+          <div class="setting-group">
+            <div class="setting-heading">
+              <div>
+                <strong>Offline review export</strong>
+                <span>Exports one row per indexed file. Leave ACTION blank to keep; DELETE is reserved for a future validated import.</span>
+              </div>
+              <output id="export-file-count">0 files</output>
+            </div>
+            <div class="setting-action">
+              <button class="button secondary" id="export-csv-button">Export review CSV</button>
+              <span>Includes stable IDs, signatures, folder paths, URLs, and cached metadata.</span>
+            </div>
+          </div>
+          <p class="settings-note">Index settings are read when a scan begins; delete concurrency is read when a delete job begins. An operation already in progress keeps the values it started with.</p>
+        </div>
+        <div class="modal-footer">
+          <span>Defaults: 8–12 seconds · 2 passes · 5 delete workers</span>
+          <div>
+            <button class="button secondary" id="cancel-settings-button">Cancel</button>
+            <button class="button primary" id="save-settings-button">Save settings</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script type="module" src="explorer.js"></script>
+  </body>
+</html>

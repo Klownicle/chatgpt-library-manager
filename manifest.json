@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Library Manager",
+  "description": "A fast, locally cached explorer for the ChatGPT Library.",
+  "version": "0.7.6",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "storage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Toggle Library Manager above ChatGPT Library"
+  },
+  "side_panel": {
+    "default_path": "explorer.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/library*"
+      ],
+      "js": [
+        "page-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/library*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "explorer.html",
+        "explorer.css",
+        "explorer.js",
+        "store.js"
+      ],
+      "matches": [
+        "https://chatgpt.com/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' data: blob: https:"
+  }
+}
