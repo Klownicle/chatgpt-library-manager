@@ -2,6 +2,8 @@
 
 An installable Chrome extension that gives the ChatGPT Library a fast, locally cached file-explorer view.
 
+![ChatGPT Library Manager docked above the ChatGPT Library](assets/library-manager-docked.png)
+
 ## Quick installation
 
 1. Download the ZIP from the [latest release](https://github.com/Klownicle/chatgpt-library-manager/releases/latest).
@@ -64,6 +66,12 @@ The left **Folder navigation** area is contextual rather than one indefinitely e
 - The undocked view does not perform indexing or live folder synchronization. Its indexing control changes to **Dock to index** or **Dock to update**.
 - **Dock above Library** returns the manager to the horizontal panel above ChatGPT Library, navigates the live page to the manager's selected folder, and enables indexing and folder refresh.
 - **Connected** means the extension can communicate with an open ChatGPT Library tab. It does not mean an undocked view is allowed to index; live indexing still requires the top dock.
+
+### Clear local cache
+
+The **Clear local cache** button appears in the lower-left corner beneath the cached-row count. After confirmation, it removes the extension's locally indexed file/folder metadata, scan history, learned folder URLs, and current selections, then returns the manager to its empty root view.
+
+It does **not** delete or modify any files in ChatGPT. Use it when you want to discard the local index and build a clean one again. Extension settings and any separate delete calibration are not cleared by this button.
 
 ## What this milestone does
 
