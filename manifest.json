@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ChatGPT Library Manager",
   "description": "A fast, locally cached explorer for the ChatGPT Library.",
-  "version": "0.7.6",
+  "version": "0.8.1",
   "minimum_chrome_version": "116",
   "permissions": [
     "tabs",

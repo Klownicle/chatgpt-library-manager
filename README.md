@@ -1,4 +1,4 @@
-# ChatGPT Library Manager — 0.7.6
+# ChatGPT Library Manager — 0.8.1
 
 An installable Chrome extension that gives the ChatGPT Library a fast, locally cached file-explorer view.
 
@@ -11,7 +11,7 @@ An installable Chrome extension that gives the ChatGPT Library a fast, locally c
 3. Open `chrome://extensions` in Chrome.
 4. Turn on **Developer mode** in the upper-right corner.
 5. Click **Load unpacked**.
-6. Select the extracted `chatgpt-library-manager-0.7.6` folder containing `manifest.json`.
+6. Select the extracted `chatgpt-library-manager-0.8.1` folder containing `manifest.json`.
 7. Open [ChatGPT Library](https://chatgpt.com/library), then click the extension's toolbar icon.
 
 > [!IMPORTANT]
@@ -84,6 +84,26 @@ It does **not** delete or modify any files in ChatGPT. Use it when you want to d
 - Provides a deletion-review queue, explicit one-file calibration, and selected-file direct deletion with progress, retries, cancellation, and immediate cache reconciliation.
 
 ## Version history
+
+### Version 0.8.1 resilient indexing and folder navigation
+
+- Waits for ChatGPT's current List-view controls and rows to finish rendering before an automatic folder scan begins.
+- Scrolls and verifies the current Library grid itself, while tracking rendered-row and captured-preview counts in live progress.
+- Treats confirmed empty folders and stable short folders that do not require scrolling as successfully indexed.
+- Converts ChatGPT's temporary `blob:` image thumbnails into portable cached previews for the manager.
+- Preserves captured rows and clears stale “indexing now” status text when final verification fails.
+- Navigates nested folders one URL transition at a time and remembers each resulting folder URL before continuing.
+- Excludes ChatGPT's hidden parent-folder navigation controls from indexed Library items.
+
+### Version 0.8.0 current ChatGPT Library compatibility
+
+- Opens the root Library on ChatGPT's **All** tab (`/library?tab=all`) instead of the new default Suggested view.
+- Switches ChatGPT's Library to **List view** before indexing so names, modified dates, and sizes are available consistently.
+- Restores top docking with ChatGPT's current page shell, which no longer exposes the old `main#main` structure.
+- Recognizes the current card layout, `Select <filename>` controls, and current delete-confirmation dialogs during deletion calibration.
+- Resets and advances ChatGPT's current nested Library scroll surface so deep scans continue loading rows from top to bottom.
+- Captures thumbnails from current lazy-image, `srcset`, data-attribute, and CSS background-image forms.
+- Retains fallbacks for the earlier table layout and its stable `libfile_…` controls.
 
 ### Version 0.7.6 callback-based runtime messaging
 

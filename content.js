@@ -6,18 +6,22 @@
   let hydratedFolderRoute = "";
   let scanInProgress = false;
   let topDockState = null;
+  let topDockReady = false;
   let pendingDeleteConfirmation = false;
   let deleteReplayCancelled = false;
   let captureStartedAt = 0;
   let capturedRequests = [];
   let captureReadyResolver = null;
   const replayRequests = new Map();
+  const cachedPreviewByImage = new WeakMap();
+  const cachedPreviewBySource = new Map();
 
   const PAGE_HOOK_SOURCE = "chatgpt-library-manager-page";
   const EXTENSION_HOOK_SOURCE = "chatgpt-library-manager-extension";
 
   document.addEventListener("click", observeNativeDeleteConfirmation, true);
   window.addEventListener("message", handlePageHookMessage);
+  window.addEventListener("message", handleDockFrameMessage);
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleMessage(message)
@@ -117,6 +121,7 @@
   async function handleMessage(message) {
     switch (message?.type) {
       case "library:ping":
+        await ensureListView();
         await hydrateFolderPathHintFromUrl();
         return { ready: true, page: describePage() };
       case "library:scanCurrentFolder":
@@ -150,7 +155,7 @@
       case "library:closeTopDock":
         return closeTopDock();
       case "library:getDockState":
-        return { open: Boolean(topDockState), height: topDockState?.height || 0 };
+        return { open: Boolean(topDockState), ready: Boolean(topDockState && topDockReady), height: topDockState?.height || 0 };
       default:
         throw new Error("Unknown Library bridge message.");
     }
@@ -179,6 +184,13 @@
     }
   }
 
+  function handleDockFrameMessage(event) {
+    const message = event.data;
+    if (!message || message.source !== "chatgpt-library-manager-dock" || message.type !== "ready") return;
+    if (!topDockState?.frame || event.source !== topDockState.frame.contentWindow) return;
+    topDockReady = true;
+  }
+
   function postToPageHook(type, payload = null) {
     window.postMessage({ source: EXTENSION_HOOK_SOURCE, type, payload }, "*");
   }
@@ -199,17 +211,17 @@
   function describePage() {
     return {
       isLibrary: location.pathname.startsWith("/library"),
+      libraryTab: new URL(location.href).searchParams.get("tab") || "suggested",
       folderPath: detectFolderPath(),
       title: document.title,
-      visibleRows: collectRowElements().length
+      visibleRows: collectRowElements().length,
+      emptyFolder: isExplicitEmptyLibraryView()
     };
   }
 
   function observeNativeDeleteConfirmation(event) {
-    const button = event.target instanceof Element
-      ? event.target.closest('[data-testid="confirm-delete-recall-file-button"]')
-      : null;
-    if (!button || pendingDeleteConfirmation) return;
+    const button = event.target instanceof Element ? event.target.closest("button") : null;
+    if (!button || button !== findDeleteConfirmButton() || pendingDeleteConfirmation) return;
 
     const items = collectSelectedFilesForDeletion();
     if (!items.length) return;
@@ -220,16 +232,7 @@
   function collectSelectedFilesForDeletion() {
     const folderPath = normalizeFolderPath(detectFolderPath());
     return collectRowElements()
-      .filter((row) => {
-        if (row.getAttribute("aria-selected") === "true") return true;
-        const selected = row.querySelector([
-          'input[type="checkbox"]:checked',
-          '[role="checkbox"][aria-checked="true"]',
-          '[data-testid^="artifact-checkbox-bridge-libfile_"][data-state="checked"]',
-          '[data-testid^="artifact-checkbox-bridge-libfile_"][aria-checked="true"]'
-        ].join(","));
-        return Boolean(selected);
-      })
+      .filter((row) => isRowSelected(row))
       .map((row) => extractItem(row, folderPath))
       .filter((item) => item?.kind === "file")
       .map(({ id, name, folderPath: itemFolderPath, signature }) => ({
@@ -244,7 +247,7 @@
     const deadline = Date.now() + 20000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const confirmButton = document.querySelector('[data-testid="confirm-delete-recall-file-button"]');
+      const confirmButton = findDeleteConfirmButton();
       if (confirmButton) continue;
 
       const renderedIds = new Set(
@@ -321,35 +324,29 @@
 
   async function prepareNativeDelete(item) {
     if (!item?.id || !item?.name) throw new Error("The selected cached file has no stable identity.");
-    let match = findRenderedFileByExactId(item.id);
+    let match = findRenderedFile(item);
     if (!match) {
       await searchLibrary(item.name);
-      match = await waitForExactRenderedFile(item.id, 15000);
+      match = await waitForRenderedFile(item, 15000);
     }
     if (!match) throw new Error(`Could not find the exact file “${item.name}” in ChatGPT.`);
-    const bridge = match.row.querySelector('button[data-testid^="artifact-checkbox-bridge-libfile_"]');
+    const bridge = findSelectionControl(match.row, item);
     if (!bridge) throw new Error(`Could not select “${item.name}” using ChatGPT’s current Library controls.`);
     bridge.click();
-    await waitForValue(() => match.row.getAttribute("aria-selected") === "true", 5000,
+    await waitForValue(() => isRowSelected(match.row, bridge), 5000,
       `ChatGPT did not select “${item.name}”.`);
     const deleteButton = await waitForValue(findBulkDeleteButton, 8000,
       "ChatGPT did not expose its Delete action for the selected file.");
     deleteButton.click();
-    const confirmButton = await waitForValue(() => {
-      const button = document.querySelector('[data-testid="confirm-delete-recall-file-button"]');
-      if (!button) return null;
-      const disabled = button.disabled || button.hasAttribute("disabled")
-        || button.getAttribute("aria-disabled") === "true"
-        || button.hasAttribute("data-visually-disabled");
-      return disabled ? null : button;
-    }, 120000, "ChatGPT did not make its final Delete confirmation available.");
+    const confirmButton = await waitForValue(findDeleteConfirmButton, 120000,
+      "ChatGPT did not make its final Delete confirmation available.");
     return { match, confirmButton };
   }
 
   async function waitForNativeDeletion(item) {
     return waitForValue(() => {
-      if (document.querySelector('[data-testid="confirm-delete-recall-file-button"]')) return false;
-      return !findRenderedFileByExactId(item.id);
+      if (findDeleteConfirmButton()) return false;
+      return !findRenderedFile(item);
     }, 120000, `ChatGPT did not confirm that “${item.name}” was deleted.`);
   }
 
@@ -467,6 +464,20 @@
     return null;
   }
 
+  function findRenderedFile(item) {
+    const exact = findRenderedFileByExactId(item.id);
+    if (exact) return exact;
+    const folderPath = detectFolderPath();
+    const rows = collectRowElements();
+    const matches = rows.map((row) => ({ row, item: extractItem(row, folderPath), rows }))
+      .filter((match) => match.item?.kind === "file")
+      .filter((match) => (
+        (item.remoteToken && match.item.remoteToken === item.remoteToken)
+        || normalizeText(match.item.name) === normalizeText(item.name)
+      ));
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   async function waitForExactRenderedFile(id, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     let match = findRenderedFileByExactId(id);
@@ -478,10 +489,66 @@
     return match;
   }
 
+  async function waitForRenderedFile(item, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let match = findRenderedFile(item);
+    while (!match && Date.now() < deadline) {
+      throwIfLibraryLoadFailed();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      match = findRenderedFile(item);
+    }
+    return match;
+  }
+
+  function findSelectionControl(row, item = {}) {
+    const controls = [...row.querySelectorAll([
+      'button[data-testid^="artifact-checkbox-bridge-libfile_"]',
+      'input[type="checkbox"]',
+      '[role="checkbox"]',
+      'button[aria-label^="Select " i]'
+    ].join(","))].filter(isVisible);
+    const expected = normalizeText(`Select ${item.name || ""}`).toLowerCase();
+    return controls.find((control) => normalizeText(control.getAttribute("aria-label")).toLowerCase() === expected)
+      || controls.find((control) => /^select\s+/i.test(control.getAttribute("aria-label") || ""))
+      || controls[0]
+      || null;
+  }
+
+  function isRowSelected(row, control = findSelectionControl(row)) {
+    if (row.getAttribute("aria-selected") === "true") return true;
+    if (!control) return false;
+    if (control instanceof HTMLInputElement && control.checked) return true;
+    return control.getAttribute("aria-checked") === "true"
+      || control.getAttribute("data-state") === "checked"
+      || control.hasAttribute("checked");
+  }
+
+  function findDeleteConfirmButton() {
+    const legacy = document.querySelector('[data-testid="confirm-delete-recall-file-button"]');
+    if (legacy && isEnabledButton(legacy)) return legacy;
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].filter(isVisible);
+    for (const dialog of dialogs) {
+      const buttons = [...dialog.querySelectorAll("button")].filter((button) => {
+        if (!isVisible(button) || !isEnabledButton(button)) return false;
+        const description = normalizeText(`${button.textContent || ""} ${button.getAttribute("aria-label") || ""}`);
+        return /^(?:confirm\s+)?delete(?:\s+(?:file|files|item|items))?$/i.test(description);
+      });
+      if (buttons.length) return buttons.at(-1);
+    }
+    return null;
+  }
+
+  function isEnabledButton(button) {
+    return !button.disabled
+      && !button.hasAttribute("disabled")
+      && button.getAttribute("aria-disabled") !== "true"
+      && !button.hasAttribute("data-visually-disabled");
+  }
+
   function findBulkDeleteButton() {
     const candidates = [...document.querySelectorAll("button")].filter((button) => {
       if (!isVisible(button)) return false;
-      if (button.matches('[data-testid="confirm-delete-recall-file-button"]')) return false;
+      if (button === findDeleteConfirmButton() || button.closest('[role="dialog"], [aria-modal="true"]')) return false;
       if (button.closest("[data-page-table-row-actions]")) return false;
       const description = normalizeText(`${button.textContent || ""} ${button.getAttribute("aria-label") || ""}`);
       return /(^|\s)(delete|trash|remove)(\s|$)/i.test(description);
@@ -514,6 +581,8 @@
     if (!location.pathname.startsWith("/library")) {
       throw new Error("Navigate this tab to chatgpt.com/library first.");
     }
+
+    await ensureListView(true);
 
     throwIfLibraryLoadFailed();
 
@@ -548,34 +617,18 @@
       ensureScanOptimizationStyles();
       const initialSurfaces = findScrollSurfaces();
       rememberSurfacePositions(initialSurfaces, originalPositions);
-      if (initialSurfaces[0]) setSurfacePosition(initialSurfaces[0], 0);
+      for (const surface of initialSurfaces) setSurfacePosition(surface, 0);
       window.scrollTo({ top: 0, behavior: "auto" });
       await waitForListChange(450);
     }
 
     while (pass < (deep ? 1000 : 1)) {
-      if (deep && document.hidden) {
-        onProgress({
-          type: "progress",
-          folderPath,
-          items: [],
-          totalObserved: collected.size,
-          pass,
-          waitingForVisibility: true,
-          unchangedPasses,
-          knownBoundaryPasses,
-          requiredKnownItemPasses,
-          atBottom: false,
-          scroll: null
-        });
-        await waitForPageVisible(isCancelled);
-      }
       if (isCancelled()) throw new Error("Indexing was cancelled.");
       throwIfLibraryLoadFailed();
       pass += 1;
       const beforeCount = collected.size;
       const visibleRows = collectRowElements(pass === 1 ? 0 : 720);
-      const visibleItems = collectItems(folderPath, visibleRows);
+      const visibleItems = await collectItemsWithPortablePreviews(folderPath, visibleRows);
       const batch = [];
       let reachedKnownBoundary = false;
       let discoveredUncachedThisPass = false;
@@ -595,8 +648,13 @@
           preserveSourceOrder: incrementalMode && isUnchangedKnown
         };
         collected.set(orderedItem.id, orderedItem);
-        if (emittedSignatures.get(orderedItem.id) !== orderedItem.signature) {
-          emittedSignatures.set(orderedItem.id, orderedItem.signature);
+        const emissionFingerprint = hashString([
+          orderedItem.signature,
+          orderedItem.previewUrl || "",
+          orderedItem.remoteToken || ""
+        ].join("|"));
+        if (emittedSignatures.get(orderedItem.id) !== emissionFingerprint) {
+          emittedSignatures.set(orderedItem.id, emissionFingerprint);
           batch.push(orderedItem);
         }
         if (isUnchangedKnown) {
@@ -615,21 +673,13 @@
       rememberSurfacePositions(surfaces, originalPositions);
       lastSurfaceSnapshot = surfaces.map(describeSurface);
       const primary = surfaces[0] || null;
-      const bottomTolerance = primary
-        ? Math.max(96, Math.min(180, primary.viewport * 0.2))
-        : 0;
-      const primaryRect = primary?.element.getBoundingClientRect();
-      const lastRowRect = visibleRows.at(-1)?.getBoundingClientRect();
-      const lastLoadedRowVisible = Boolean(
-        primaryRect
-        && lastRowRect
-        && lastRowRect.bottom <= primaryRect.bottom + 3
-        && lastRowRect.bottom >= primaryRect.top
-      );
+      const renderedTailVisible = isRenderedLibraryTailVisible(visibleRows, primary?.element);
       const atBottom = Boolean(
-        primary
-        && primary.maximum > 0
-        && (primary.position >= primary.maximum - bottomTolerance || lastLoadedRowVisible)
+        surfaces.length
+        && surfaces.every((surface) => {
+          const tolerance = Math.max(96, Math.min(180, surface.viewport * 0.2));
+          return surface.position >= surface.maximum - tolerance;
+        })
       );
 
       onProgress({
@@ -642,13 +692,32 @@
         knownBoundaryPasses,
         requiredKnownItemPasses,
         waitingForVisibility: false,
+        renderedRows: visibleRows.length,
+        thumbnailCount: [...collected.values()].filter((item) => item.previewUrl).length,
+        renderedTailVisible,
         atBottom,
         scroll: primary ? {
           position: Math.round(primary.position),
           maximum: Math.round(primary.maximum),
-          viewport: Math.round(primary.viewport)
+          viewport: Math.round(primary.viewport),
+          surfaceCount: surfaces.length
         } : null
       });
+
+      // ChatGPT renders a real empty-state instead of any file rows for an
+      // empty folder. That is a verified end, not an incomplete scan.
+      if (visibleItems.length === 0 && isExplicitEmptyLibraryView()) {
+        complete = true;
+        break;
+      }
+
+      // A populated folder whose complete rendered tail fits in the viewport
+      // does not need to scroll. This also covers ChatGPT wrapping a two-row
+      // list in a larger unrelated page scroller.
+      if (renderedTailVisible && unchangedPasses >= 4 && !isLibraryListLoading()) {
+        complete = true;
+        break;
+      }
 
       // The Library is normally sorted newest-first. Continue beyond the first
       // unchanged cached row for the configured number of clean verification
@@ -659,7 +728,10 @@
       }
 
       bottomStablePasses = atBottom && unchangedPasses > 0 ? bottomStablePasses + 1 : 0;
-      if (movedAtLeastOnce && bottomStablePasses >= 4) {
+      // A short folder can expose a scroll container that is already at its
+      // maximum, so no programmatic movement is possible. Four unchanged
+      // cooldown passes at the real bottom are still sufficient verification.
+      if (bottomStablePasses >= 4) {
         complete = true;
         break;
       }
@@ -669,9 +741,9 @@
         break;
       }
 
-      const movedThisPass = advanceScroll(surfaces, visibleRows);
+      const movedThisPass = await advanceScroll(surfaces, visibleRows);
       movedAtLeastOnce ||= movedThisPass;
-      if (movedThisPass) await waitForScrollCooldown(scrollDelayRange);
+      if (movedThisPass || atBottom) await waitForScrollCooldown(scrollDelayRange);
       else await waitForListChange(850);
 
       // Never claim completion when no actual scrolling surface was moved.
@@ -742,6 +814,39 @@
     throw error;
   }
 
+  function isExplicitEmptyLibraryView() {
+    const main = document.querySelector("main") || document.body;
+    const text = normalizeText(main.innerText || main.textContent);
+    return /upload a file to start building your library\.?/i.test(text)
+      || /this folder is empty\.?/i.test(text)
+      || /no files (?:in|inside) this folder\.?/i.test(text);
+  }
+
+  function isLibraryListLoading() {
+    const main = document.querySelector("main") || document.body;
+    const busy = [...main.querySelectorAll("[aria-busy='true'], [role='progressbar'], [role='status']")]
+      .some((element) => isVisible(element) && /load|progress|busy/i.test(
+        normalizeText(`${element.getAttribute("aria-label") || ""} ${element.textContent || ""}`)
+      ));
+    if (busy) return true;
+    const text = normalizeText(main.innerText || main.textContent);
+    return /(?:loading|fetching) (?:more )?(?:files|library items)/i.test(text);
+  }
+
+  function isRenderedLibraryTailVisible(rows, scrollElement = null) {
+    if (!rows.length) return false;
+    const lastRow = rows
+      .slice()
+      .sort((a, b) => a.getBoundingClientRect().bottom - b.getBoundingClientRect().bottom)
+      .pop();
+    if (!lastRow) return false;
+    const rowRect = lastRow.getBoundingClientRect();
+    const surfaceRect = scrollElement?.getBoundingClientRect?.();
+    const visibleTop = Math.max(0, surfaceRect?.top ?? 0);
+    const visibleBottom = Math.min(window.innerHeight, surfaceRect?.bottom ?? window.innerHeight);
+    return rowRect.top >= visibleTop - 4 && rowRect.bottom <= visibleBottom + 4;
+  }
+
   function collectItems(folderPath, rows = collectRowElements()) {
     const seen = new Set();
     const items = [];
@@ -752,6 +857,57 @@
       items.push(item);
     }
     return items;
+  }
+
+  async function collectItemsWithPortablePreviews(folderPath, rows = collectRowElements()) {
+    const seen = new Set();
+    const items = [];
+    const observed = await Promise.all(rows.map(async (row) => {
+      const item = extractItem(row, folderPath);
+      if (!item || item.previewUrl) return item;
+      const previewUrl = await extractPortablePreview(row);
+      return previewUrl ? { ...item, previewUrl } : item;
+    }));
+    for (const item of observed) {
+      if (!item || seen.has(item.id)) continue;
+      seen.add(item.id);
+      items.push(item);
+    }
+    return items;
+  }
+
+  async function ensureListView(requireReady = false) {
+    const deadline = Date.now() + (requireReady ? 15000 : 2500);
+    let clicked = false;
+    while (Date.now() < deadline) {
+      if (isListViewLayout()) return true;
+      const listButton = [...document.querySelectorAll("button, [role='button']")].find((button) => (
+        isVisible(button)
+        && normalizeText(button.getAttribute("aria-label") || button.textContent).toLowerCase() === "list view"
+      ));
+      if (listButton && !clicked) {
+        const alreadySelected = listButton.getAttribute("aria-pressed") === "true"
+          || listButton.getAttribute("aria-selected") === "true"
+          || listButton.getAttribute("data-state") === "on";
+        if (!alreadySelected) listButton.click();
+        clicked = true;
+      }
+      throwIfLibraryLoadFailed();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (requireReady) {
+      throw new Error("ChatGPT did not finish preparing List view within 15 seconds. Reload the Library and try again.");
+    }
+    return false;
+  }
+
+  function isListViewLayout() {
+    const headers = [...document.querySelectorAll("[role='columnheader'], th")]
+      .map((header) => normalizeText(header.textContent || header.getAttribute("aria-label")))
+      .filter(Boolean);
+    return headers.some((header) => /^name$/i.test(header))
+      && headers.some((header) => /^modified$/i.test(header))
+      && headers.some((header) => /^size$/i.test(header));
   }
 
   function ensureScanOptimizationStyles() {
@@ -769,10 +925,18 @@
 
   function collectRowElements(tailLimit = 0) {
     const root = document.querySelector("main") || document.body;
+    const semanticCards = [...root.querySelectorAll([
+      'input[type="checkbox"][aria-label^="Select " i]',
+      '[role="checkbox"][aria-label^="Select " i]',
+      'button[aria-label^="Select " i]'
+    ].join(","))]
+      .map((control) => findLibraryCard(control, root))
+      .filter(Boolean);
     let explicitCandidates = [
       ...root.querySelectorAll(
         "tbody tr, [role='row'], [data-testid*='library-item' i], [data-testid*='file-row' i]"
-      )
+      ),
+      ...semanticCards
     ];
     if (tailLimit > 0 && explicitCandidates.length > tailLimit) {
       explicitCandidates = explicitCandidates.slice(-tailLimit);
@@ -794,6 +958,24 @@
     return mostSpecificRows(heuristic);
   }
 
+  function findLibraryCard(control, root) {
+    const selectedName = normalizeText(control.getAttribute("aria-label")).replace(/^select\s+/i, "");
+    let current = control.parentElement;
+    while (current && current !== root) {
+      const labels = [...current.querySelectorAll("button[aria-label], a[aria-label]")]
+        .map((element) => normalizeText(element.getAttribute("aria-label")));
+      const hasActions = labels.some((label) => /^open actions? menu for\s+/i.test(label));
+      const hasMatchingItem = !selectedName || labels.some((label) => (
+        label === selectedName
+        || label.toLowerCase() === `open folder ${selectedName}`.toLowerCase()
+        || label.toLowerCase() === `open file ${selectedName}`.toLowerCase()
+      ));
+      if (hasActions && hasMatchingItem) return current;
+      current = current.parentElement;
+    }
+    return control.closest("[role='row'], li, [data-testid*='library-item' i], [data-testid*='file-row' i]");
+  }
+
   function mostSpecificRows(rows) {
     const unique = [...new Set(rows)];
     return unique.filter(
@@ -803,9 +985,11 @@
 
   function isPlausibleRow(element) {
     if (!(element instanceof HTMLElement) || !isVisible(element)) return false;
+    if (element.querySelectorAll("[role='columnheader'], th").length >= 2) return false;
     const text = normalizeText(element.innerText || element.textContent);
-    if (!text || /^(name\s+modified\s+size|name|modified|size)$/i.test(text)) return false;
-    if (/^(?:filter|filters)$/i.test(text)) return false;
+    if (!text || /^(?:select all\s+)?name\s+modified\s+size$/i.test(text)
+      || /^(name|modified|size)$/i.test(text)) return false;
+    if (/^(?:filter|filters|parent folders?|back to parent folder)$/i.test(text)) return false;
     if (/\b(search|upload|new)\b/i.test(text) && text.length < 30) return false;
     return true;
   }
@@ -818,9 +1002,14 @@
     if (!lines.length) return null;
 
     const directCells = [...row.children].filter((element) => element.getAttribute("role") === "gridcell");
-    const semanticName = [...row.querySelectorAll("button[aria-label], [aria-label]")]
-      .map((element) => element.getAttribute("aria-label") || "")
-      .find((label) => label && !/^open actions? menu/i.test(label)) || "";
+    const semanticLabels = [...row.querySelectorAll("button[aria-label], a[aria-label], [role='checkbox'][aria-label], input[aria-label]")]
+      .map((element) => normalizeText(element.getAttribute("aria-label")))
+      .filter(Boolean);
+    const directName = semanticLabels.find((label) => !/^(?:open actions? menu for|select)\s+/i.test(label));
+    const selectedName = semanticLabels.find((label) => /^select\s+/i.test(label))?.replace(/^select\s+/i, "");
+    const actionName = semanticLabels.find((label) => /^open actions? menu for\s+/i.test(label))
+      ?.replace(/^open actions? menu for\s+/i, "");
+    const semanticName = directName || selectedName || actionName || "";
     const semanticModified = normalizeText(directCells[2]?.innerText || directCells[2]?.textContent);
     const semanticSize = normalizeText(directCells[3]?.innerText || directCells[3]?.textContent);
     const combined = normalizeText(`${semanticName} ${row.getAttribute("aria-label") || ""} ${lines.join(" ")}`);
@@ -836,6 +1025,7 @@
       || extractFullName(row, lines, modified, size, href);
     if (!name || name.length > 360) return null;
     if (/^(?:filter|filters)$/i.test(name) && !modified && !size && !href) return null;
+    if (/^(?:parent folders?|back to parent folder)$/i.test(name)) return null;
 
     const hasFileExtension = /\.[a-z0-9]{1,10}$/i.test(name.trim());
     const folderSignal = /\bfolder\b/i.test(combined) || /\/folder(?:s)?\//i.test(href);
@@ -843,8 +1033,7 @@
       || lines.includes("—")
       || directCells.some((cell) => normalizeText(cell.innerText || cell.textContent) === "—");
     const kind = folderSignal || (!hasFileExtension && !size && emptySizeSignal) ? "folder" : "file";
-    const thumbnail = row.querySelector("img");
-    const previewUrl = thumbnail?.currentSrc || thumbnail?.src || "";
+    const previewUrl = extractPreviewUrl(row);
     const remoteToken = extractRemoteToken(row);
     const stableDomId = getStableDomId(row);
     const identitySeed = stableDomId || href || `${folderPath}|${kind}|${name}`;
@@ -868,11 +1057,106 @@
   }
 
   function extractRemoteToken(row) {
-    const bridge = row.querySelector('button[data-testid^="artifact-checkbox-bridge-libfile_"]');
-    const testId = bridge?.getAttribute("data-testid") || "";
-    const prefix = "artifact-checkbox-bridge-";
-    const token = testId.startsWith(prefix) ? testId.slice(prefix.length) : "";
+    const owner = row.closest("[data-library-selection-id]");
+    const direct = owner?.getAttribute("data-library-selection-id") || "";
+    if (/^libfile_[a-z0-9_-]+$/i.test(direct)) return direct;
+    const markup = `${row.outerHTML || ""} ${owner?.outerHTML || ""}`;
+    const token = markup.match(/\blibfile_[a-z0-9_-]+\b/i)?.[0] || "";
     return /^libfile_[a-z0-9_-]+$/i.test(token) ? token : "";
+  }
+
+  function extractPreviewUrl(row) {
+    const directCandidates = [];
+    for (const image of row.querySelectorAll("img")) {
+      directCandidates.push(
+        image.currentSrc,
+        image.src,
+        image.getAttribute("data-src"),
+        image.getAttribute("data-lazy-src"),
+        image.getAttribute("data-thumbnail-url")
+      );
+    }
+    for (const source of row.querySelectorAll("source[srcset], img[srcset]")) {
+      const srcset = source.getAttribute("srcset") || "";
+      directCandidates.push(...srcset.split(",").map((entry) => entry.trim().split(/\s+/)[0]));
+    }
+    for (const element of [row, ...row.querySelectorAll([
+      "[data-src]",
+      "[data-thumbnail-url]",
+      "[style*='background-image']",
+      "[class*='thumbnail' i]",
+      "[class*='preview' i]"
+    ].join(","))]) {
+      directCandidates.push(
+        element.getAttribute?.("data-src"),
+        element.getAttribute?.("data-thumbnail-url")
+      );
+      const background = getComputedStyle(element).backgroundImage || "";
+      const match = background.match(/url\(["']?(.+?)["']?\)/i);
+      if (match) directCandidates.push(match[1]);
+    }
+    const candidates = directCandidates.map((value) => String(value || "").trim()).filter(Boolean);
+    return candidates.find((value) => /^(?:https?:|data:image\/)/i.test(value))
+      || "";
+  }
+
+  async function extractPortablePreview(row) {
+    for (const image of row.querySelectorAll("img")) {
+      const source = String(image.currentSrc || image.src || "").trim();
+      if (!source) continue;
+      if (/^(?:https?:|data:image\/)/i.test(source)) return source;
+      if (!source.startsWith("blob:")) continue;
+
+      const cachedForImage = cachedPreviewByImage.get(image);
+      if (cachedForImage?.source === source) {
+        return cachedForImage.promise ? await cachedForImage.promise : (cachedForImage.value || "");
+      }
+      if (cachedPreviewBySource.has(source)) return cachedPreviewBySource.get(source) || "";
+
+      const promise = convertBlobPreview(source, image);
+      cachedPreviewByImage.set(image, { source, promise, value: "" });
+      const value = await promise;
+      cachedPreviewByImage.set(image, { source, promise: null, value });
+      if (value) cachedPreviewBySource.set(source, value);
+      return value;
+    }
+    return "";
+  }
+
+  async function convertBlobPreview(source, image) {
+    try {
+      const response = await fetch(source);
+      if (!response.ok) return makePortablePreviewFromCanvas(image);
+      const blob = await response.blob();
+      return await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => resolve(makePortablePreviewFromCanvas(image));
+        reader.readAsDataURL(blob);
+      });
+    } catch {
+      return makePortablePreviewFromCanvas(image);
+    }
+  }
+
+  function makePortablePreviewFromCanvas(image) {
+    if (!(image instanceof HTMLImageElement)
+      || !image.complete
+      || !image.naturalWidth
+      || !image.naturalHeight) return "";
+    try {
+      const longestSide = Math.max(image.naturalWidth, image.naturalHeight);
+      const scale = Math.min(1, 256 / longestSide);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      const context = canvas.getContext("2d", { alpha: false });
+      if (!context) return "";
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL("image/webp", 0.78);
+    } catch {
+      return "";
+    }
   }
 
   function extractFullName(row, lines, modified, size, href) {
@@ -966,7 +1250,7 @@
   }
 
   function getStableDomId(row) {
-    const keys = ["pageTableSelectionId", "fileId", "folderId", "itemId", "id"];
+    const keys = ["librarySelectionId", "pageTableSelectionId", "fileId", "folderId", "itemId", "id"];
     let current = row;
     for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
       for (const key of keys) {
@@ -990,7 +1274,6 @@
     if (!match) throw new Error(`Could not find ${expectedKind} “${name}” in the loaded Library results.`);
 
     const { row, item, rows } = match;
-    const beforeFirstId = getStableDomId(rows[0] || row);
     const beforePathname = location.pathname;
     const targets = row.matches("a, button") ? [row] : [...row.querySelectorAll("a, button")];
     const expectedFolderLabel = `open folder ${item.name}`.toLowerCase();
@@ -1001,14 +1284,21 @@
       || targets.find((element) => normalizeText(element.textContent) === item.name)
       || targets.find((element) => !/^open actions? menu/i.test(element.getAttribute("aria-label") || ""))
       || row;
-    target.scrollIntoView({ block: "center" });
-    await waitForListChange(100);
-    target.click();
     if (expectedKind === "folder") {
       const folderPath = detectFolderPath();
       folderPathHint = `${folderPath} / ${item.name}`;
-      await waitForFolderRows(beforeFirstId, beforePathname);
+      target.scrollIntoView({ block: "center" });
+      // Reply to the background before ChatGPT destroys this document during
+      // a full folder navigation. The background verifies the new URL and
+      // waits for the next page's rows before continuing a nested chain.
+      setTimeout(() => {
+        if (target.isConnected) target.click();
+      }, 0);
+      return { ok: true, activated: item, navigationStarted: true, beforePathname };
     }
+    target.scrollIntoView({ block: "center" });
+    await waitForListChange(100);
+    target.click();
     return { ok: true, activated: item };
   }
 
@@ -1072,19 +1362,6 @@
     return true;
   }
 
-  async function waitForFolderRows(previousFirstId, previousPathname) {
-    const deadline = Date.now() + 12000;
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 140));
-      throwIfLibraryLoadFailed();
-      if (location.pathname !== previousPathname) return;
-      const rows = collectRowElements(120);
-      const firstId = getStableDomId(rows[0]);
-      if (firstId && firstId !== previousFirstId) return;
-    }
-    throw new Error("ChatGPT did not finish opening that folder. Try the folder again.");
-  }
-
   function detectFolderPath() {
     const breadcrumb = document.querySelector(
       "nav[aria-label*='breadcrumb' i], [data-testid*='breadcrumb' i]"
@@ -1132,9 +1409,18 @@
   async function toggleTopDock(forceOpen) {
     const shouldOpen = typeof forceOpen === "boolean" ? forceOpen : !topDockState;
     if (!shouldOpen) return closeTopDock();
-    if (topDockState) return { open: true, height: topDockState.height };
+    // Recreate an existing dock when an explicit open request arrives. This
+    // replaces a stale/blank extension frame after an extension reload.
+    if (topDockState) closeTopDock();
 
-    const pageShell = [...document.body.children].find((element) => element.querySelector?.("main#main"));
+    await ensureListView();
+
+    const main = document.querySelector("main, [role='main']");
+    const pageShell = [...document.body.children].find((element) => (
+      element.id !== "chatgpt-library-manager-top-dock"
+      && main
+      && (element === main || element.contains(main))
+    )) || main?.parentElement;
     if (!pageShell) throw new Error("Could not locate the ChatGPT page shell for docking.");
 
     const { topDockHeight = 340 } = await chrome.storage.local.get("topDockHeight");
@@ -1151,7 +1437,7 @@
       boxShadow: "0 12px 36px rgba(0,0,0,.38)"
     });
 
-    const shadow = host.attachShadow({ mode: "closed" });
+    const shadow = host.attachShadow({ mode: "open" });
     const frame = document.createElement("iframe");
     frame.src = chrome.runtime.getURL("explorer.html?mode=topdock");
     frame.title = "ChatGPT Library Manager";
@@ -1169,6 +1455,7 @@
       background: "transparent"
     });
     shadow.append(frame, resizeHandle);
+    topDockReady = false;
 
     const original = {
       height: pageShell.style.height,
@@ -1202,10 +1489,20 @@
       event.preventDefault();
     });
 
+    topDockState = { host, frame, pageShell, original, height, onPointerMove, onPointerUp };
     document.body.append(host);
-    topDockState = { host, pageShell, original, height, onPointerMove, onPointerUp };
     applyHeight(height);
-    return { open: true, height };
+    try {
+      await waitForValue(
+        () => topDockReady,
+        6000,
+        "The Library Manager dock did not finish loading. Reload the ChatGPT Library tab and try again."
+      );
+    } catch (error) {
+      closeTopDock();
+      throw error;
+    }
+    return { open: true, ready: true, height };
   }
 
   function closeTopDock() {
@@ -1218,11 +1515,15 @@
     pageShell.style.marginTop = original.marginTop;
     host.remove();
     topDockState = null;
+    topDockReady = false;
     window.dispatchEvent(new Event("resize"));
     return { open: false };
   }
 
   function findScrollSurfaces(rows = collectRowElements()) {
+    const primary = findPrimaryLibraryScroller(rows);
+    if (primary) return [describeScrollableElement(primary, rows)];
+
     const elements = new Set();
     if (document.scrollingElement) elements.add(document.scrollingElement);
 
@@ -1244,20 +1545,69 @@
         const maximum = Math.max(0, element.scrollHeight - element.clientHeight);
         const style = getComputedStyle(element);
         const rowsInside = rows.filter((row) => element.contains(row)).length;
-        const overflowBonus = /(auto|scroll|overlay)/.test(style.overflowY) ? 500000 : 0;
-        const score = rowsInside * 1000000 + overflowBonus + maximum * 100 + element.clientHeight;
+        const ancestorDistance = rows.reduce((nearest, row) => {
+          if (!element.contains(row)) return nearest;
+          let current = row;
+          let distance = 0;
+          while (current && current !== element && distance < 1000) {
+            current = current.parentElement;
+            distance += 1;
+          }
+          return current === element ? Math.min(nearest, distance) : nearest;
+        }, 1000);
+        const overflowBonus = /(auto|scroll|overlay)/.test(style.overflowY) ? 1000000000000 : 0;
+        const proximityBonus = Math.max(0, 1000 - ancestorDistance) * 1000000;
+        const score = overflowBonus + proximityBonus + rowsInside * 1000 + maximum;
         return {
           element,
           position: element.scrollTop,
           maximum,
           viewport: element.clientHeight || window.innerHeight,
           rowsInside,
+          ancestorDistance,
           overflowY: style.overflowY,
           score
         };
       })
-      .filter((surface) => surface.maximum > 3 && surface.viewport > 80 && surface.rowsInside > 0)
+      .filter((surface) => (
+        surface.maximum > 3
+        && surface.viewport > 80
+        && surface.rowsInside > 0
+        && (surface.element === document.scrollingElement || !/(hidden|clip)/.test(surface.overflowY))
+      ))
       .sort((a, b) => b.score - a.score);
+  }
+
+  function findPrimaryLibraryScroller(rows) {
+    const grid = document.querySelector("[role='grid'][aria-label*='library files' i], [role='grid'][aria-label*='library' i]")
+      || rows[0]?.closest("[role='grid']");
+    let current = grid?.parentElement || rows[0]?.parentElement || null;
+    let bestFallback = null;
+    while (current && current !== document.documentElement) {
+      const maximum = Math.max(0, current.scrollHeight - current.clientHeight);
+      if (maximum > 3 && current.clientHeight > 80) {
+        const overflowY = getComputedStyle(current).overflowY;
+        if (/(auto|scroll|overlay)/.test(overflowY)) return current;
+        if (!bestFallback && !/(hidden|clip)/.test(overflowY)) bestFallback = current;
+      }
+      current = current.parentElement;
+    }
+    return bestFallback;
+  }
+
+  function describeScrollableElement(element, rows) {
+    const style = getComputedStyle(element);
+    const rowsInside = rows.filter((row) => element.contains(row)).length;
+    return {
+      element,
+      position: element.scrollTop,
+      maximum: Math.max(0, element.scrollHeight - element.clientHeight),
+      viewport: element.clientHeight || window.innerHeight,
+      rowsInside,
+      ancestorDistance: 0,
+      overflowY: style.overflowY,
+      score: Number.MAX_SAFE_INTEGER
+    };
   }
 
   function rememberSurfacePositions(surfaces, originalPositions) {
@@ -1278,19 +1628,34 @@
 
   function setSurfacePosition(surface, top) {
     const before = surface.element.scrollTop;
-    surface.element.scrollTop = Math.max(0, Math.min(surface.maximum, top));
+    const target = Math.max(0, Math.min(surface.maximum, top));
+    if (surface.element === document.scrollingElement) {
+      window.scrollTo({ top: target, behavior: "auto" });
+    } else if (typeof surface.element.scrollTo === "function") {
+      surface.element.scrollTo({ top: target, behavior: "auto" });
+    } else {
+      surface.element.scrollTop = target;
+    }
     surface.element.dispatchEvent(new Event("scroll", { bubbles: true }));
     window.dispatchEvent(new Event("scroll"));
     return Math.abs(surface.element.scrollTop - before) > 1;
   }
 
-  function advanceScroll(surfaces, rows) {
-    const primary = surfaces[0] || null;
-    let moved = false;
+  async function advanceScroll(surfaces, rows) {
+    const startingPositions = new Map(surfaces.map((surface) => [surface.element, surface.element.scrollTop]));
 
-    if (primary) {
-      const step = Math.max(320, primary.viewport * 0.72);
-      moved = setSurfacePosition(primary, primary.position + step);
+    for (const surface of surfaces) {
+      const step = Math.max(320, surface.viewport * 0.72);
+      try {
+        surface.element.dispatchEvent(new WheelEvent("wheel", {
+          bubbles: true,
+          cancelable: true,
+          deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+          deltaY: step,
+          view: window
+        }));
+      } catch {}
+      setSurfacePosition(surface, surface.element.scrollTop + step);
     }
 
     const lastRow = rows
@@ -1298,10 +1663,7 @@
       .sort((a, b) => a.getBoundingClientRect().bottom - b.getBoundingClientRect().bottom)
       .pop();
     if (lastRow) {
-      const before = primary?.element.scrollTop ?? window.scrollY;
       lastRow.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" });
-      const after = primary?.element.scrollTop ?? window.scrollY;
-      moved ||= Math.abs(after - before) > 1;
     }
 
     // IntersectionObserver-based lists often load only after their sentinel sees
@@ -1309,7 +1671,21 @@
     document.dispatchEvent(new Event("scroll", { bubbles: true }));
     window.dispatchEvent(new Event("scroll"));
     window.dispatchEvent(new Event("resize"));
-    return moved;
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Some React scroll containers restore their previous position during the
+    // same frame. Reapply the nudge once after layout and verify real movement.
+    for (const surface of surfaces) {
+      const start = startingPositions.get(surface.element) || 0;
+      if (surface.element.scrollTop <= start + 1 && start < surface.maximum - 1) {
+        setSurfacePosition(surface, start + Math.max(320, surface.viewport * 0.72));
+      }
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    return surfaces.some((surface) => (
+      Math.abs(surface.element.scrollTop - (startingPositions.get(surface.element) || 0)) > 1
+    ));
   }
 
   function describeSurface(surface) {
@@ -1322,13 +1698,18 @@
       position: Math.round(element.scrollTop),
       maximum: Math.round(Math.max(0, element.scrollHeight - element.clientHeight)),
       viewport: Math.round(element.clientHeight),
-      rowsInside: surface.rowsInside
+      rowsInside: surface.rowsInside,
+      ancestorDistance: surface.ancestorDistance
     };
   }
 
   function waitForListChange(milliseconds) {
     return new Promise((resolve) => {
-      const root = document.querySelector("main") || document.body;
+      const rows = collectRowElements();
+      const root = rows[0]?.closest("[role='grid']")
+        || findPrimaryLibraryScroller(rows)
+        || document.querySelector("main")
+        || document.body;
       let quietTimer;
       let hardTimer;
       const done = () => {

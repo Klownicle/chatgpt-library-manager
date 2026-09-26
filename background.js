@@ -1,6 +1,6 @@
 import { deleteCachedItems, finalizeScan, getAllItems, upsertItemsBatch } from "./store.js";
 
-const LIBRARY_URL = "https://chatgpt.com/library";
+const LIBRARY_URL = "https://chatgpt.com/library?tab=all";
 const EXPLORER_URL = chrome.runtime.getURL("explorer.html");
 const managerScanPorts = new Set();
 let activeLibraryPort = null;
@@ -105,7 +105,7 @@ async function handleMessage(message, sender) {
     case "manager:cancelDelete":
       return cancelDirectDelete();
     case "manager:scanCurrentFolder":
-      return sendToLibrary({
+      return sendToAllLibrary({
         type: "library:scanCurrentFolder",
         expectedFolderPath: message.folderPath || "",
         knownSignatures: message.knownSignatures || {},
@@ -455,8 +455,9 @@ async function commitConfirmedDeletions(items) {
 
 async function showItemInNewTab(item) {
   if (!item?.id || !item?.name) throw new Error("Select one indexed file first.");
-  const searchUrl = `${LIBRARY_URL}?search=${encodeURIComponent(item.name)}`;
-  const tab = await chrome.tabs.create({ url: searchUrl, active: true });
+  const searchUrl = new URL(LIBRARY_URL);
+  searchUrl.searchParams.set("search", item.name);
+  const tab = await chrome.tabs.create({ url: searchUrl.href, active: true });
   if (!tab.id) throw new Error("Chrome did not create the ChatGPT tab.");
   await registerAuxiliaryLibraryTab(tab.id);
   await waitForTabComplete(tab.id);
@@ -512,19 +513,27 @@ async function navigateLibraryPath(chain, targetPath, forceDock = false) {
         folderPath: targetPath
       });
       if (response?.ok === false) throw new Error(response.error || `Could not verify ${targetPath}.`);
-      if (targetPath === "Library") await waitForLibraryRows(tab.id);
+      await waitForLibraryRows(tab.id);
     } else if (chain.length) {
       await waitForLibraryRows(tab.id);
     }
 
     if (!directFolderUrl) {
       for (const folder of chain) {
+        const beforeNavigation = await chrome.tabs.get(tab.id);
         const response = await sendWhenBridgeReady(tab.id, {
           type: "library:enterFolder",
           id: folder.id || "",
           name: folder.name
         });
         if (response?.ok === false) throw new Error(response.error || `Could not open ${folder.name}.`);
+        await waitForFolderUrlChange(tab.id, beforeNavigation.url || "");
+        const hintResponse = await sendWhenBridgeReady(tab.id, {
+          type: "library:setFolderPathHint",
+          folderPath: folder.path
+        });
+        if (hintResponse?.ok === false) throw new Error(hintResponse.error || `Could not verify ${folder.name}.`);
+        await waitForLibraryRows(tab.id);
         await rememberCurrentFolderUrl(folder.path).catch(() => null);
       }
     }
@@ -595,10 +604,25 @@ async function waitForLibraryRows(tabId) {
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     const response = await sendWhenBridgeReady(tabId, { type: "library:ping" }).catch(() => null);
-    if (response?.page?.visibleRows > 0) return response.page;
+    if (response?.page?.visibleRows > 0 || response?.page?.emptyFolder) return response.page;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   throw new Error("ChatGPT Library did not render its folder rows after reloading.");
+}
+
+async function waitForFolderUrlChange(tabId, previousUrl) {
+  const previous = stripLibraryUrl(previousUrl || "");
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const current = await chrome.tabs.get(tabId);
+    const currentUrl = validateLibraryFolderUrl(current.url || "");
+    if (currentUrl && currentUrl !== previous) {
+      await sendWhenBridgeReady(tabId, { type: "library:ping" });
+      return currentUrl;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 180));
+  }
+  throw new Error("ChatGPT did not change to the requested folder URL.");
 }
 
 async function openTopDockWhenReady(tabId) {
@@ -658,10 +682,11 @@ async function toggleTopDockFromToolbar() {
   } else {
     await chrome.tabs.update(tab.id, { active: true });
     if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+    tab = await ensureAllLibraryRoute(tab);
   }
 
   const dockState = await sendWhenBridgeReady(tab.id, { type: "library:getDockState" });
-  if (dockState?.open) {
+  if (dockState?.open && dockState?.ready !== false) {
     return sendWhenBridgeReady(tab.id, { type: "library:toggleTopDock", open: false });
   }
 
@@ -790,17 +815,19 @@ async function getConnectionState() {
 async function openLibrary() {
   const existing = await findLibraryTab();
   if (existing?.id) {
-    await chrome.tabs.update(existing.id, { active: true });
-    if (existing.windowId) await chrome.windows.update(existing.windowId, { focused: true });
-    return { tabId: existing.id, reused: true };
+    const tab = await ensureAllLibraryRoute(existing);
+    await chrome.tabs.update(tab.id, { active: true });
+    if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+    return { tabId: tab.id, reused: true };
   }
   const tab = await chrome.tabs.create({ url: LIBRARY_URL, active: true });
   return { tabId: tab.id, reused: false };
 }
 
 async function focusLibrary() {
-  const tab = await findLibraryTab();
+  let tab = await findLibraryTab();
   if (!tab?.id) throw new Error("Open ChatGPT Library first.");
+  tab = await ensureAllLibraryRoute(tab);
   await chrome.tabs.update(tab.id, { active: true });
   if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
   return { tabId: tab.id };
@@ -814,6 +841,37 @@ async function sendToLibrary(payload) {
   } catch {
     throw new Error("The Library bridge is not ready. Reload the ChatGPT Library tab once.");
   }
+}
+
+async function sendToAllLibrary(payload) {
+  let tab = await findLibraryTab();
+  if (!tab?.id) throw new Error("Open ChatGPT Library first.");
+  tab = await ensureAllLibraryRoute(tab);
+  try {
+    return await sendWhenBridgeReady(tab.id, payload);
+  } catch {
+    throw new Error("The Library bridge is not ready. Reload the ChatGPT Library tab once.");
+  }
+}
+
+async function ensureAllLibraryRoute(tab) {
+  if (!tab?.id) return tab;
+  let current;
+  try {
+    current = new URL(tab.url || LIBRARY_URL);
+  } catch {
+    return tab;
+  }
+  if (current.origin !== "https://chatgpt.com" || current.pathname.replace(/\/$/, "") !== "/library") {
+    return tab;
+  }
+  if (current.searchParams.get("tab") === "all") return tab;
+
+  current.searchParams.set("tab", "all");
+  const completion = waitForNextTabComplete(tab.id);
+  await chrome.tabs.update(tab.id, { url: current.href });
+  await completion;
+  return chrome.tabs.get(tab.id);
 }
 
 async function handleScanManagerMessage(managerPort, message) {

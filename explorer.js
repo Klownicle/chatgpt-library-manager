@@ -124,6 +124,9 @@ state.viewMode = requestedMode === "topdock"
     : "sidepanel";
 document.body.classList.toggle("topdock-mode", state.viewMode === "topdock");
 document.body.classList.toggle("undocked-mode", state.viewMode === "tab");
+if (state.viewMode === "topdock") {
+  window.parent.postMessage({ source: "chatgpt-library-manager-dock", type: "ready" }, "*");
+}
 
 bindEvents();
 connectScanPort();
@@ -608,6 +611,10 @@ async function handleScanEvent(message) {
     };
     elements.scanButton.classList.remove("scanning");
     elements.scanSummary.textContent = message.error || "The previous index was interrupted.";
+    // Progress batches are already saved even when end verification fails.
+    // Reload them so the partial folder remains visible and the sidebar stops
+    // showing the stale “indexing now” state.
+    await reloadCache();
     renderConnection();
     renderLiveScan();
     renderIndexError();
@@ -617,6 +624,10 @@ async function handleScanEvent(message) {
 
 async function reloadCache() {
   [state.items, state.scans] = await Promise.all([getAllItems(), getAllScans()]);
+  state.items = state.items.filter((item) => !(
+    item.kind === "folder"
+    && /^(?:parent folders?|back to parent folder)$/i.test(String(item.name || "").trim())
+  ));
   const validIds = new Set(state.items.filter((item) => item.kind === "file").map((item) => item.id));
   state.selected = new Set([...state.selected].filter((id) => validIds.has(id)));
   render();
@@ -1118,13 +1129,17 @@ function renderLiveScan() {
   elements.liveCount.textContent = String(progress.totalObserved || 0);
   elements.liveScan.classList.toggle("waiting", Boolean(progress.waitingForVisibility));
   elements.livePass.textContent = progress.waitingForVisibility ? "Paused" : `Pass ${progress.pass || 0}`;
-  elements.liveBatch.textContent = progress.waitingForVisibility
+  const scanActivity = progress.waitingForVisibility
     ? "Library tab is hidden"
     : progress.knownBoundaryPasses > 0
       ? `Cached boundary ${progress.knownBoundaryPasses}/${progress.requiredKnownItemPasses || state.knownItemPasses}`
     : progress.batchCount
       ? `+${progress.batchCount} new/changed`
       : "Checking loaded rows";
+  const renderedDetails = Number.isFinite(progress.renderedRows)
+    ? ` · ${progress.renderedRows} rendered · ${progress.thumbnailCount || 0} previews`
+    : "";
+  elements.liveBatch.textContent = `${scanActivity}${renderedDetails}`;
   elements.liveProgressBar.style.width = `${percentage}%`;
   const fullScrollText = progress.waitingForVisibility
     ? "Return to the ChatGPT Library tab to resume indexing"
